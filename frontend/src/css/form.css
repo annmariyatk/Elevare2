@@ -1,0 +1,162 @@
+.form-page {
+  min-height: 100vh;
+  background: #F8FAFC;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 20px;
+}
+
+.form-card {
+  width: 100%;
+  max-width: 520px;
+  background: white;
+  padding: 25px;
+  border-radius: 15px;
+  box-shadow: 0px 8px 20px rgba(0, 0, 0, 0.08);
+}
+
+.form-title {
+  text-align: center;
+  font-size: 22px;
+  font-weight: bold;
+  color: #222;
+  margin-bottom: 20px;
+}
+
+.form-group {
+  margin-bottom: 15px;
+}
+
+.form-group label {
+  font-weight: 600;
+  display: block;
+  margin-bottom: 6px;
+  color: #444;
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #cfd8dc;
+  border-radius: 8px;
+  outline: none;
+  font-size: 14px;
+}
+
+.form-group input:focus {
+  border-color: #007bff;
+}
+
+.warning-box {
+  background: #fff3cd;
+  padding: 12px;
+  border-radius: 10px;
+  margin-bottom: 15px;
+  border: 1px solid #ffeeba;
+}
+
+.warning-box h4 {
+  margin: 0;
+  font-size: 16px;
+  color: #856404;
+}
+
+.warning-box p {
+  margin: 8px 0;
+  font-size: 14px;
+  color: #444;
+}
+
+.mentor-box {
+  margin-top: 15px;
+  background: #f1f5f9;
+  padding: 15px;
+  border-radius: 12px;
+  border: 1px solid #cce5ff;
+}
+
+.mentor-box h3 {
+  margin-top: 0;
+}
+
+.mentor-selected {
+  margin-top: 12px;
+  color: green;
+  font-size: 14px;
+}
+
+.upload-box {
+  margin-top: 15px;
+  background: #f8f9fa;
+  padding: 15px;
+  border-radius: 12px;
+  border: 1px solid #ddd;
+}
+
+.file-name {
+  margin-top: 10px;
+  color: green;
+  font-size: 14px;
+}
+
+.btn-primary {
+  background: #007bff;
+  color: white;
+  padding: 10px 14px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+.btn-primary:hover {
+  background: #0056b3;
+}
+
+.btn-warning {
+  background: #ffb300;
+  color: black;
+  padding: 10px 14px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+.btn-warning:hover {
+  background: #e6a000;
+}
+
+.btn-submit {
+  width: 100%;
+  margin-top: 20px;
+  background: #28a745;
+  color: white;
+  padding: 12px;
+  border: none;
+  border-radius: 10px;
+  font-size: 15px;
+  font-weight: bold;
+  cursor: pointer;
+}
+
+.btn-submit:hover {
+  background: #218838;
+}
+
+.btn-submit:disabled {
+  background: #8bcf9b;
+  cursor: not-allowed;
+}
+
+.mentor-box {
+  position: relative;
+  z-index: 10;
+}
+
+.btn-primary {
+  position: relative;
+  z-index: 20;
+}

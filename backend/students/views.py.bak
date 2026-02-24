@@ -1,0 +1,3648 @@
+import secrets
+from datetime import timedelta, date
+
+from django.utils import timezone
+from django.contrib.auth.hashers import check_password, make_password
+import random
+from django.db.models import Q, Avg
+
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from rest_framework.decorators import api_view, parser_classes
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.views import APIView
+
+from django.core.mail import send_mail
+from django.conf import settings
+
+from .models import (
+    Student,
+    StudyConnection,
+    Certificate,
+    StudentUploadedCertificate,
+    StudentSkill,
+    Rating,
+    Assessment,
+    Teacher,
+    ChatMessage,
+    Resource,
+    SkillPost
+)
+
+from .serializers import StudentSerializer, StudentSkillSerializer
+from admins.models import Admin
+
+
+
+# =========================
+# HELPERS
+# =========================
+def get_student_from_token(request):
+    auth = request.headers.get("Authorization")
+    if not auth:
+        return None
+    token = auth.replace("Bearer ", "").strip()
+    return Student.objects.filter(api_token=token).first()
+
+
+# =========================
+# AUTH
+# =========================
+@api_view(["POST"])
+def signup(request):
+    serializer = StudentSerializer(data=request.data)
+    if serializer.is_valid():
+        serializer.save()
+        return Response({"message": "Signup successful"})
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(["POST"])
+def check_unique(request):
+    email = request.data.get("email")
+    phone = request.data.get("phone_number")
+    errors = {}
+
+    if email and Student.objects.filter(email=email).exists():
+        errors["email"] = "Email already exists"
+
+    if phone and Student.objects.filter(phone_number=phone).exists():
+        errors["phone_number"] = "Phone number already exists"
+
+    return Response(errors)
+
+
+@api_view(["POST"])
+def login_view(request):
+    email = request.data.get("email")
+    password = request.data.get("password")
+
+    if not email or not password:
+        return Response({"error": "Email and password required"}, status=400)
+
+    # ---------- ADMIN LOGIN ----------
+    try:
+        admin = Admin.objects.get(email=email)
+        if check_password(password, admin.password):
+            token = secrets.token_hex(32)
+            admin.api_token = token
+            admin.save()
+            return Response({"role": "admin", "token": token, "admin_id": admin.admin_id})
+    except Admin.DoesNotExist:
+        pass
+
+    # ---------- STUDENT LOGIN ----------
+    try:
+        student = Student.objects.get(email=email)
+        if check_password(password, student.password):
+            token = secrets.token_hex(32)
+            student.api_token = token
+            student.save()
+            return Response({"role": "student", "token": token, "student_id": student.student_id})
+    except Student.DoesNotExist:
+        pass
+
+    return Response({"error": "Invalid credentials"}, status=401)
+
+
+@api_view(["POST"])
+def forgot_password_request(request):
+    email = request.data.get("email")
+    if not email:
+        return Response({"error": "Email is required"}, status=400)
+    
+    try:
+        student = Student.objects.get(email=email)
+    except Student.DoesNotExist:
+        return Response({"error": "No account found with this email"}, status=404)
+    
+    # Generate 6-digit OTP
+    otp = str(random.randint(100000, 999999))
+    student.reset_otp = otp
+    student.otp_expiry = timezone.now() + timedelta(minutes=10)
+    student.save()
+    
+    try:
+        send_mail(
+            subject="Password Reset OTP - ELAVRE",
+            message=f"Your OTP for password reset is: {otp}. It is valid for 10 minutes.",
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+    except Exception as e:
+        return Response({"error": f"Failed to send email: {str(e)}"}, status=500)
+    
+    return Response({"message": "OTP sent to your email ✅"})
+
+@api_view(["POST"])
+def forgot_password_reset(request):
+    email = request.data.get("email")
+    otp = request.data.get("otp")
+    new_password = request.data.get("new_password")
+    
+    if not all([email, otp, new_password]):
+        return Response({"error": "All fields are required"}, status=400)
+    
+    try:
+        student = Student.objects.get(email=email)
+    except Student.DoesNotExist:
+        return Response({"error": "No account found with this email"}, status=404)
+    
+    if not student.reset_otp or student.reset_otp != otp:
+        return Response({"error": "Invalid OTP"}, status=400)
+    
+    if not student.otp_expiry or timezone.now() > student.otp_expiry:
+        return Response({"error": "OTP has expired"}, status=400)
+    
+    # Update password using hashing
+    student.password = make_password(new_password)
+    student.reset_otp = None
+    student.otp_expiry = None
+    student.save()
+    
+    return Response({"message": "Password updated successfully ✅"})
+
+
+@api_view(["POST"])
+def logout(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    student.api_token = None
+    student.save()
+    return Response({"message": "Logged out successfully"})
+
+
+# =========================
+# DASHBOARD ✅ FIXED
+# =========================
+# =========================
+# DASHBOARD ✅ FIXED
+# =========================
+class StudentDashboardView(APIView):
+    def get(self, request):
+        student = get_student_from_token(request)
+        if not student:
+            return Response({"error": "Unauthorized"}, status=401)
+
+        # ================= ACTIVE STUDY =================
+        active = StudyConnection.objects.filter(
+            Q(student1=student) | Q(student2=student),
+            status__in=["Started", "Progress"],
+        ).order_by("-study_id").first()
+
+        active_data = None
+        if active:
+            partner = (
+                active.student2.username
+                if active.student1 == student
+                else active.student1.username
+            )
+
+            # ✅ FIRST try linked skill
+            my_skill = (
+                active.student1_skill
+                if active.student1 == student
+                else active.student2_skill
+            )
+
+            # 🔥 FALLBACK: get latest skill if not linked
+            if not my_skill:
+                my_skill = (
+                    StudentSkill.objects
+                    .filter(student=student)
+                    .order_by("-student_skill_id")
+                    .first()
+                )
+
+            # 🔥 AUTO COMPLETE IF END DATE PASSED
+            if active.end_date < date.today():
+                active.status = "Completed"
+                active.save()
+
+                if my_skill:
+                    my_skill.status = 1
+                    my_skill.save()
+
+                # Also free partner skill
+                partner_skill_obj = active.student2_skill if active.student1 == student else active.student1_skill
+                if partner_skill_obj:
+                    partner_skill_obj.status = 1
+                    partner_skill_obj.save()
+                
+                # Reset teacher
+                if active.teacher:
+                    active.teacher.status = 0
+                    active.teacher.save()
+                    active.teacher = None
+                    active.save(update_fields=["teacher"])
+                
+                active = None # No longer active
+            else:
+                active_data = {
+                    "study_id": active.study_id,
+                    "partner": partner,
+                    "offer": my_skill.offer if my_skill else None,
+                    "want": my_skill.want if my_skill else None,
+                    "level": my_skill.level if my_skill else None,
+                    "status": active.status,
+                    "start_date": active.start_date,
+                    "end_date": active.end_date,
+                    "teacher_name": active.teacher.name if active.teacher else None,
+                }
+
+        # ================= HISTORY =================
+        history_qs = StudyConnection.objects.filter(
+            Q(student1=student) | Q(student2=student),
+            status__in=["Completed", "Cancelled"]
+        ).order_by("-study_id")
+
+        completed_count = history_qs.filter(status="Completed").count()
+        cancelled_count = history_qs.filter(status="Cancelled").count()
+
+        history_qs = history_qs[:5]
+
+        history_data = []
+        for s in history_qs:
+            partner = s.student2 if s.student1 == student else s.student1
+
+            skill = (
+                s.student1_skill
+                if s.student1 == student
+                else s.student2_skill
+            )
+
+            # 🔥 fallback for history too
+            if not skill:
+                skill = (
+                    StudentSkill.objects
+                    .filter(student=student)
+                    .order_by("-student_skill_id")
+                    .first()
+                )
+
+            history_data.append({
+                "study_id": s.study_id,
+                "partner": partner.username,
+                "offer_skill": skill.offer if skill else None,
+                "want_skill": skill.want if skill else None,
+                "status": s.status,
+                "start_date": s.start_date,
+                "end_date": s.end_date,
+            })
+
+        return Response({
+            "username": student.username,
+            "active_study": active_data,
+            "history": history_data,
+            "completed_skills": completed_count,
+            "cancelled_studies": cancelled_count,
+            "certificates": Certificate.objects.filter(student=student).count(),
+            "profile_incomplete": {
+                "about": not bool(student.about_me),
+                "picture": not bool(student.picture),
+                "skills": not StudentSkill.objects.filter(student=student).exists()
+            }
+        }, status=200)
+
+
+
+# =========================
+# ✅ NEW API: GET MY LEVEL + PARTNER LEVEL (Form.jsx needs this)
+# GET /api/study/my-level/<study_id>/
+# =========================
+@api_view(["GET"])
+def get_my_study_level(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "StudyConnection not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    if student == study.student1:
+        my_skill = study.student1_skill
+        partner_skill = study.student2_skill
+        role = "student1"
+    else:
+        my_skill = study.student2_skill
+        partner_skill = study.student1_skill
+        role = "student2"
+
+    my_level = my_skill.level if my_skill else "Basic"
+    partner_level = partner_skill.level if partner_skill else "Basic"
+
+    return Response({
+        "study_id": study.study_id,
+        "role": role,
+        "my_level": my_level,
+        "partner_level": partner_level,
+    }, status=200)
+
+
+# =========================
+# UPDATE STUDY STATUS
+# =========================
+@api_view(["POST"])
+def update_study_status(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    status_value = request.data.get("status")
+
+    if status_value not in ["Completed", "Cancelled"]:
+        return Response({"error": "Invalid status"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "StudyConnection not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # =========================
+    # UPDATE STUDY STATUS
+    # =========================
+    study.status = status_value
+    study.save()
+
+    # =========================
+    # FREE STUDENT SKILLS (Completed OR Cancelled)
+    # =========================
+    if status_value in ["Completed", "Cancelled"]:
+        if study.student1_skill:
+            study.student1_skill.status = 1
+            study.student1_skill.save()
+
+        if study.student2_skill:
+            study.student2_skill.status = 1
+            study.student2_skill.save()
+
+    # =========================
+    # 🔥 RESET TEACHER STATUS
+    # =========================
+    if study.teacher:
+        study.teacher.status = 0
+        study.teacher.save()
+        study.teacher = None
+        study.save(update_fields=["teacher"])
+
+    return Response(
+        {
+            "message": f"Study marked as {status_value} ✅",
+            "study_id": study.study_id
+        },
+        status=200
+    )
+
+# =========================
+# PROFILE (GET / PUT / DELETE)
+# =========================
+@api_view(["GET", "PUT", "DELETE"])
+@parser_classes([MultiPartParser, FormParser, JSONParser])
+def my_student_profile(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    if request.method == "GET":
+        serializer = StudentSerializer(student)
+        data = serializer.data
+
+        data["uploaded_certificates"] = [
+            {"id": cert.id, "file": request.build_absolute_uri(cert.file.url)}
+            for cert in student.uploaded_certificates.all()
+        ]
+        return Response(data)
+
+    if request.method == "PUT":
+        serializer = StudentSerializer(student, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        for file in request.FILES.getlist("uploaded_certificates"):
+            StudentUploadedCertificate.objects.create(student=student, file=file)
+
+        serializer = StudentSerializer(student)
+        data = serializer.data
+        data["uploaded_certificates"] = [
+            {"id": cert.id, "file": request.build_absolute_uri(cert.file.url)}
+            for cert in student.uploaded_certificates.all()
+        ]
+        return Response(data, status=200)
+
+    if request.method == "DELETE":
+        cert_id = request.data.get("certificate_id")
+        if not cert_id:
+            return Response({"error": "certificate_id required"}, status=400)
+
+        try:
+            cert = StudentUploadedCertificate.objects.get(id=cert_id, student=student)
+            cert.delete()
+            return Response({"message": "Certificate deleted ✅"}, status=200)
+        except StudentUploadedCertificate.DoesNotExist:
+            return Response({"error": "Certificate not found"}, status=404)
+
+
+# =========================
+# CHECK STUDENT ELIGIBILITY
+# =========================
+@api_view(["GET"])
+def check_student_eligibility(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_ok = StudyConnection.objects.filter(
+        Q(student1=student) | Q(student2=student),
+        status__in=["Completed", "Cancelled"]
+    ).exists()
+
+    assessment_ok = Assessment.objects.filter(
+        student=student,
+        status__in=["Completed", "Cancelled"]
+    ).exists()
+
+    return Response({"study_ok": study_ok, "assessment_ok": assessment_ok})
+
+
+# =========================
+# GET LATEST SKILL
+# =========================
+@api_view(["GET"])
+def get_latest_skill(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    latest_skill = StudentSkill.objects.filter(student=student).order_by("-student_skill_id").first()
+
+    if not latest_skill:
+        return Response({"exists": False})
+
+    return Response({
+        "exists": True,
+        "student_skill_id": latest_skill.student_skill_id,
+        "offer": latest_skill.offer,
+        "want": latest_skill.want,
+        "level": latest_skill.level,
+        "status": latest_skill.status,
+    })
+
+
+@api_view(["GET"])
+def get_latest_pending_skill(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    skill = StudentSkill.objects.filter(student=student, status=0).order_by("-student_skill_id").first()
+    if not skill:
+        return Response({"exists": False})
+
+    return Response({
+        "exists": True,
+        "student_skill_id": skill.student_skill_id,
+        "offer": skill.offer,
+        "want": skill.want,
+        "level": skill.level,
+        "status": skill.status,
+    })
+
+
+# =========================
+# STUDENT SKILL
+# =========================
+# =========================
+# STUDENT SKILL
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def student_skill_create_list(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+
+    def clean(v):
+        return v.strip() if v and v.strip() else None
+
+    offer = clean(request.data.get("offer"))
+    want = clean(request.data.get("want"))
+    description = clean(request.data.get("description"))
+    level = request.data.get("level", "Basic")
+
+    # =========================
+    # CREATE / UPDATE PENDING SKILL
+    # =========================
+    skill, _ = StudentSkill.objects.update_or_create(
+        student=student,
+        status=0,
+        defaults={
+            "offer": offer,
+            "want": want,
+            "description": description,
+            "level": level,
+        }
+    )
+
+    # =========================
+    # 🔥 SMART LINK SKILL TO STUDY
+    # =========================
+    if study_id:
+        try:
+            study = StudyConnection.objects.get(study_id=study_id)
+
+            # BOTH NULL → first fills student1
+            if not study.student1_skill and not study.student2_skill:
+                study.student1_skill = skill
+
+            # student1 exists, student2 null
+            elif study.student1_skill and not study.student2_skill:
+                if study.student1 == student:
+                    study.student1_skill = skill
+                else:
+                    study.student2_skill = skill
+
+            # student1 null, student2 exists
+            elif not study.student1_skill and study.student2_skill:
+                if study.student2 == student:
+                    study.student2_skill = skill
+                else:
+                    study.student1_skill = skill
+
+            # both exist → update own only
+            else:
+                if study.student1 == student:
+                    study.student1_skill = skill
+                elif study.student2 == student:
+                    study.student2_skill = skill
+
+            study.save()
+
+        except StudyConnection.DoesNotExist:
+            pass
+
+    return Response(
+        {
+            "message": "Skill saved & linked to study ✅",
+            "offer": skill.offer,
+            "want": skill.want,
+        },
+        status=200
+    )
+
+
+
+
+
+
+# =========================
+# MATCHES
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def student_skill_matches(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    offer = request.data.get("offer")
+    want = request.data.get("want")
+
+    if not offer or not want:
+        return Response({"error": "offer and want required"}, status=400)
+
+    matches = StudentSkill.objects.filter(
+        offer__isnull=False,
+        want__isnull=False,
+        status=0,
+        offer__iexact=want,
+        want__iexact=offer,
+    ).exclude(student=student)
+
+    available = []
+    for m in matches:
+        busy = StudyConnection.objects.filter(
+            Q(student1=m.student) | Q(student2=m.student),
+            status__in=["Started", "Progress"]
+        ).exists()
+
+        if not busy:
+            available.append(m)
+
+    seen = set()
+    data = []
+    for m in available:
+        if m.student_id in seen:
+            continue
+        seen.add(m.student_id)
+
+        avg_rating = Rating.objects.filter(
+            rated_to=m.student
+        ).aggregate(avg=Avg("rating_value"))["avg"] or 0
+
+        data.append({
+            "student_id": m.student.student_id,
+            "username": m.student.username,
+            "picture": request.build_absolute_uri(m.student.picture.url)
+            if m.student.picture else None,
+            "offer": m.offer,
+            "want": m.want,
+            "level": m.level,
+            "rating": round(avg_rating, 1),
+        })
+
+    return Response(sorted(data, key=lambda x: x["rating"], reverse=True), status=200)
+
+
+# =========================
+# STUDENT DETAIL
+# =========================
+@api_view(["GET"])
+def get_student_detail(request, student_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    try:
+        s = Student.objects.get(student_id=student_id)
+    except Student.DoesNotExist:
+        return Response({"error": "Student not found"}, status=404)
+
+    # ✅ Student Uploaded Certificates
+    uploaded = [
+        {
+            "id": f"U{cert.id}",
+            "file": request.build_absolute_uri(cert.file.url),
+            "uploaded_at": cert.uploaded_at,
+            "type": "Uploaded"
+        }
+        for cert in s.uploaded_certificates.all()
+    ]
+
+    # ✅ Platform Generated Official Certificates
+    official = []
+    platform_certs = Certificate.objects.filter(student=s)
+    for pc in platform_certs:
+        if pc.certificate_file:
+            official.append({
+                "id": f"O{pc.certificate_id}",
+                "file": request.build_absolute_uri(pc.certificate_file.url),
+                "uploaded_at": pc.issued_date,
+                "type": "Official"
+            })
+
+    data = {
+        "student_id": s.student_id,
+        "username": s.username,
+        "department": s.department,
+        "year": s.year,
+        "about_me": s.about_me,
+        "skills": s.skills,
+        "picture": request.build_absolute_uri(s.picture.url) if s.picture else None,
+        "certificates": uploaded + official,
+    }
+
+    return Response(data, status=200)
+
+
+# =========================
+# CREATE STUDY CONNECTION
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def create_studyconnection(request):
+    student1 = get_student_from_token(request)
+    if not student1:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    student2_id = request.data.get("student2_id")
+    if not student2_id:
+        return Response({"error": "student2_id is required"}, status=400)
+
+    try:
+        student2 = Student.objects.get(student_id=student2_id)
+    except Student.DoesNotExist:
+        return Response({"error": "Student not found"}, status=404)
+
+    # ❌ BLOCK if logged-in student has ACTIVE study
+    active_me = StudyConnection.objects.filter(
+        Q(student1=student1) | Q(student2=student1),
+        status__in=["Started", "Progress"]
+    ).exists()
+
+    if active_me:
+        return Response(
+            {"error": "Complete your current study before connecting ❌"},
+            status=400
+        )
+
+    # ❌ BLOCK if selected student has ACTIVE study
+    active_other = StudyConnection.objects.filter(
+        Q(student1=student2) | Q(student2=student2),
+        status__in=["Started", "Progress"]
+    ).exists()
+
+    if active_other:
+        return Response(
+            {"error": "This student is already connected ❌"},
+            status=400
+        )
+
+    # ✅ Get latest pending skills (OPTIONAL, NOT MATCHED)
+    student1_skill = StudentSkill.objects.filter(
+        student=student1,
+        status=0
+    ).order_by("-student_skill_id").first()
+
+    student2_skill = StudentSkill.objects.filter(
+        student=student2,
+        status=0
+    ).order_by("-student_skill_id").first()
+
+    # ❌ Skill matching REMOVED COMPLETELY
+
+    start_date = timezone.now().date()
+    end_date = start_date + timedelta(days=7)
+
+    study = StudyConnection.objects.create(
+        student1=student1,
+        student2=student2,
+        student1_skill=student1_skill,  # may be NULL
+        student2_skill=student2_skill,  # may be NULL
+        start_date=start_date,
+        end_date=end_date,
+        status="Started"
+    )
+
+    return Response(
+        {
+            "message": "Study connection created ✅",
+            "study_id": study.study_id
+        },
+        status=201
+    )
+
+
+
+# =========================
+# TEACHER LIST
+# =========================
+@api_view(["GET"])
+def teacher_list(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    q = request.GET.get("q", "").strip()
+    department = request.GET.get("department", "").strip()
+
+    teachers = Teacher.objects.filter(status=0)
+
+    if q:
+        teachers = teachers.filter(name__icontains=q)
+
+    if department:
+        teachers = teachers.filter(department__iexact=department)
+
+    teachers = teachers.order_by("name")
+
+    data = []
+    for t in teachers:
+        data.append({
+            "teacher_id": t.teacher_id,
+            "name": t.name,
+            "email": t.email,
+            "department": t.department,
+            "profile": request.build_absolute_uri(t.profile.url) if t.profile else None,
+        })
+
+    return Response(data, status=200)
+
+
+# =========================
+# SELECT TEACHER FOR STUDY
+# =========================
+# =========================
+# SELECT / UPDATE TEACHER ✅ FIXED
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def select_teacher_for_study(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    teacher_id = request.data.get("teacher_id")
+    if not teacher_id:
+        return Response({"error": "teacher_id is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "Study not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # ✅ RESET OLD TEACHER
+    if study.teacher:
+        old_teacher = study.teacher
+        old_teacher.status = 0
+        old_teacher.save()
+
+    try:
+        new_teacher = Teacher.objects.get(teacher_id=teacher_id)
+    except Teacher.DoesNotExist:
+        return Response({"error": "Teacher not found"}, status=404)
+
+    # ✅ ASSIGN NEW TEACHER
+    new_teacher.status = 1
+    new_teacher.save()
+
+    study.teacher = new_teacher
+    study.save()
+
+    # ✅ EMAIL
+    # ✅ EMAIL - Force String Conversion for IDs
+    t_id = str(new_teacher.teacher_id)
+    s_id = str(study.study_id)
+    report_link = f"http://localhost:5173/teacher/report-issue?teacher_id={t_id}"
+
+    print(f"DEBUG: Sending Email. Teacher ID: {t_id}, Link: {report_link}")
+
+    text_body = f"""Hello {new_teacher.name},
+
+You have been assigned as mentor.
+
+Study ID: {s_id}
+Student: {student.username}
+
+REPORT ISSUE LINK:
+{report_link}
+
+Thank you,
+ELAVRE Team
+"""
+    
+    html_body = f"""
+    <div style="font-family: Arial, sans-serif; color: #333;">
+        <h2 style="color: #1E3A8A;">Mentor Assignment Notification</h2>
+        <p>Hello <strong>{new_teacher.name}</strong>,</p>
+        <p>You have been assigned as a mentor for a new study connection.</p>
+        <div style="background: #f1f5f9; padding: 15px; border-radius: 8px; margin: 20px 0;">
+            <p><strong>Study ID:</strong> {s_id}</p>
+            <p><strong>Student:</strong> {student.username}</p>
+        </div>
+        <p>If you encounter any issues with this student or study, please report it immediately using the link below:</p>
+        <p>
+            <a href="{report_link}" style="background: #dc2626; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                REPORT ISSUE
+            </a>
+        </p>
+        <p style="margin-top: 20px; font-size: 0.9em; color: #666;">
+            Or copy this link: <br>
+            <a href="{report_link}">{report_link}</a>
+        </p>
+        <hr>
+        <p>Thank you,<br>ELAVRE Team</p>
+    </div>
+    """
+
+    send_mail(
+        subject="Action Required: Mentor Assigned - ELAVRE",
+        message=text_body,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=[new_teacher.email],
+        fail_silently=False,
+        html_message=html_body
+    )
+
+    return Response(
+        {
+            "message": "Teacher updated successfully ✅",
+            "teacher_name": new_teacher.name
+        },
+        status=200
+    )
+
+
+# =========================
+# GET SELECTED TEACHER
+# =========================
+@api_view(["GET"])
+def get_selected_teacher(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "StudyConnection not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    if not study.teacher:
+        return Response({"teacher": None}, status=200)
+
+    t = study.teacher
+    return Response({
+        "teacher": {
+            "teacher_id": t.teacher_id,
+            "name": t.name,
+            "email": t.email,
+            "department": t.department,
+            "profile": request.build_absolute_uri(t.profile.url) if t.profile else None,
+        }
+    }, status=200)
+
+
+# =========================
+# UPDATE END DATE
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def update_study_enddate(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    end_date = request.data.get("end_date")
+    if not end_date:
+        return Response({"error": "end_date is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "StudyConnection not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    study.end_date = end_date
+    study.save()
+
+    return Response({"message": "End date updated ✅"}, status=200)
+
+
+# =========================
+# ✅ CREATE ASSESSMENT FOR BOTH (NO assessment_type/title)
+# POST /api/assessment/create/
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def create_assessment_for_both(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+    if not study_id:
+        return Response({"error": "study_id is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "Study not found"}, status=404)
+
+    # ❌ Security check
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # ✅ Get correct skill for logged-in student
+    skill = (
+        study.student1_skill
+        if study.student1 == student
+        else study.student2_skill
+    )
+
+    # ❌ NO OFFER + NO WANT → DO NOTHING
+    if not skill or (not skill.offer and not skill.want):
+        return Response(
+            {"message": "No skills provided. Assessment not required."},
+            status=200
+        )
+
+    # =========================
+    # CREATE ASSESSMENTS (NO DUPLICATES)
+    # =========================
+    # ✅ Create for Student 1 if they learn something
+    if study.student1_skill and study.student1_skill.want and study.student1_skill.want.lower() != "none":
+        Assessment.objects.get_or_create(
+            study=study,
+            student=study.student1
+        )
+
+    # ✅ Create for Student 2 if they learn something
+    if study.student2_skill and study.student2_skill.want and study.student2_skill.want.lower() != "none":
+        Assessment.objects.get_or_create(
+            study=study,
+            student=study.student2
+        )
+
+    # =========================
+    # MOVE STUDY → PROGRESS (ONLY ONCE)
+    # =========================
+    if study.status != "Progress":
+        study.status = "Progress"
+        study.save(update_fields=["status"])
+
+    return Response(
+        {
+            "message": "Assessment created ✅",
+            "study_status": study.status
+        },
+        status=201
+    )
+
+
+
+
+# =========================
+# UPLOAD VALIDATION FORM FILE
+# =========================
+
+
+# =========================
+# ✅ CREATE ASSESSMENT FOR BOTH
+# POST /api/assessment/create-for-both/
+# =========================
+
+# =========================
+# ✅ UPLOAD VALIDATION FORM FILE
+# POST /api/assessment/upload-validation-form/
+# =========================
+@api_view(["POST"])
+@parser_classes([MultiPartParser, FormParser])
+def upload_validation_form(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+    file = request.FILES.get("validation_form_file")
+
+    if not study_id:
+        return Response({"error": "study_id is required"}, status=400)
+
+    if not file:
+        return Response({"error": "validation_form_file is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "StudyConnection not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    assessment, _ = Assessment.objects.get_or_create(study=study, student=student)
+    assessment.validation_form_file = file
+    assessment.save()
+
+    return Response({"message": "Validation form uploaded ✅"}, status=200)
+
+
+# =========================
+# ✅ ASSESSMENT STATUS
+# GET /api/assessment/status/
+# =========================
+@api_view(["GET"])
+def assessment_status(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    # 🔥 1️⃣ Get FIRST pending assessment (Submitted)
+    pending = (
+        Assessment.objects
+        .filter(student=student, status="Submitted")
+        .order_by("assessment_id")
+        .first()
+    )
+
+    if not pending:
+        return Response(
+            {
+                "eligible": False,
+                "message": "You have no pending assessments 🎉"
+            },
+            status=200
+        )
+
+    study = pending.study
+    partner = study.student2 if study.student1 == student else study.student1
+
+    # get correct skill
+    my_skill = (
+        study.student1_skill if study.student1 == student
+        else study.student2_skill
+    )
+
+    return Response(
+        {
+            "eligible": True,
+            "assessment_id": pending.assessment_id,
+            "study_id": study.study_id,
+            "my_level": my_skill.level if my_skill else "Basic",
+            "partner_id": partner.student_id,
+            "partner_name": partner.username,
+            "teacher_name": study.teacher.name if study.teacher else None,
+        },
+        status=200
+    )
+
+
+
+# =========================
+# ✅ SUBMIT ASSESSMENT (Upload ALL)
+# POST /api/assessment/submit/
+# =========================
+@api_view(["POST"])
+@parser_classes([MultiPartParser, FormParser])
+def submit_assessment(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+    if not study_id:
+        return Response({"error": "study_id is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "StudyConnection not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # =========================
+    # SAVE / UPDATE ASSESSMENT
+    # =========================
+    assessment, _ = Assessment.objects.get_or_create(
+        study=study,
+        student=student
+    )
+
+    project_title = request.data.get("project_title")
+    assessment_work = request.data.get("assessment_work")
+
+    if project_title:
+        assessment.project_title = project_title
+
+    if assessment_work:
+        assessment.assessment_work = assessment_work
+
+    if "assessment_file" in request.FILES:
+        assessment.assessment_file = request.FILES["assessment_file"]
+
+    if "validation_form_file" in request.FILES:
+        assessment.validation_form_file = request.FILES["validation_form_file"]
+
+    assessment.status = "Completed"
+    assessment.save()
+
+    # =========================
+    # COMPLETE STUDY
+    # =========================
+    study.status = "Completed"
+    study.save()
+
+    # =========================
+    # ✅ ADDITION: MARK STUDENT SKILLS AS COMPLETED
+    # =========================
+    if study.student1_skill:
+        study.student1_skill.status = 1
+        study.student1_skill.save(update_fields=["status"])
+
+    if study.student2_skill:
+        study.student2_skill.status = 1
+        study.student2_skill.save(update_fields=["status"])
+
+    # =========================
+    # ISSUE CERTIFICATE (NO DUPLICATION ✅)
+    # =========================
+    Certificate.objects.get_or_create(
+        student=student,
+        study=study
+    )
+
+    # =========================
+    # EMAIL TEACHER (OPTIONAL)
+    # =========================
+    if study.teacher:
+        # ✅ EMAIL - Force String Conversion
+        t_id_s = str(study.teacher.teacher_id)
+        s_id_s = str(study.study_id)
+        report_link = f"http://localhost:5173/teacher/report-issue?teacher_id={t_id_s}"
+
+        print(f"DEBUG: Sending Assessment Email to {study.teacher.email}. Link: {report_link}")
+
+        text_body = f"""Hello {study.teacher.name},
+
+Student {student.username} has successfully completed the assessment.
+
+Study ID: {s_id_s}
+Project Title: {assessment.project_title or "-"}
+Assessment Work: {assessment.assessment_work or "-"}
+
+Certificate has been issued automatically.
+
+REPORT ISSUE LINK:
+{report_link}
+
+Thank you,
+ELAVRE Team
+"""
+
+        html_body = f"""
+        <div style="font-family: Arial, sans-serif; color: #333;">
+            <h2 style="color: #166534;">Assessment Completed ✅</h2>
+            <p>Hello <strong>{study.teacher.name}</strong>,</p>
+            <p>Student <strong>{student.username}</strong> has completed their assessment.</p>
+            <div style="background: #f1f5f9; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                <p><strong>Study ID:</strong> {s_id_s}</p>
+                <p><strong>Project:</strong> {assessment.project_title or "-"}</p>
+                <p><strong>Work Link:</strong> {assessment.assessment_work or "-"}</p>
+            </div>
+            <p><em>Certificate has been issued automatically.</em> 🎓</p>
+            <hr>
+            <p>If you encounter any issues:</p>
+            <p>
+                <a href="{report_link}" style="background: #dc2626; color: white; padding: 8px 16px; text-decoration: none; border-radius: 4px; font-weight: bold;">
+                    REPORT ISSUE
+                </a>
+            </p>
+            <p style="margin-top: 10px; font-size: 0.9em; color: #666;">
+                Or copy this link: <br>
+                <a href="{report_link}">{report_link}</a>
+            </p>
+            <p>Thank you,<br>ELAVRE Team</p>
+        </div>
+        """
+
+        send_mail(
+            subject="Action Required: Skill Completion - ELAVRE",
+            message=text_body,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[study.teacher.email],
+            fail_silently=False,
+            html_message=html_body
+        )
+
+    return Response(
+        {
+            "message": "Assessment completed ✅ Certificate issued 🎓"
+        },
+        status=200
+    )
+
+
+
+
+# =========================
+# ✅ SAVE RATING
+# POST /api/rating/save/
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def save_rating(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+    rating_value = request.data.get("rating_value")
+
+    if not study_id or not rating_value:
+        return Response({"error": "study_id and rating_value required"}, status=400)
+
+    try:
+        rating_value = int(rating_value)
+    except:
+        return Response({"error": "rating_value must be number"}, status=400)
+
+    if rating_value < 1 or rating_value > 5:
+        return Response({"error": "rating_value must be 1-5"}, status=400)
+
+    study = StudyConnection.objects.filter(study_id=study_id).first()
+    if not study:
+        return Response({"error": "Study not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    partner = study.student2 if study.student1 == student else study.student1
+
+    Rating.objects.update_or_create(
+        study=study,
+        rated_by=student,
+        rated_to=partner,
+        defaults={"rating_value": rating_value},
+    )
+
+    return Response({"message": "Rating saved ✅"}, status=200)
+
+
+
+# =========================
+# CHAT MESSAGES
+# =========================
+@api_view(["GET"])
+def get_chat_messages(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "Study not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # 🔥 NEW CONDITION
+    if should_close_chat(study, student):
+        ChatMessage.objects.filter(study=study).delete()
+
+        return Response(
+            {
+                "message": "No active study",
+                "study_status": study.status,
+                "data": [],
+            },
+            status=200
+        )
+
+    msgs = ChatMessage.objects.filter(study=study).order_by("sent_at")
+
+    data = [
+        {
+            "message_id": m.message_id,
+            "sender_id": m.sender.student_id,
+            "sender_name": m.sender.username,
+            "message_text": m.message_text,
+            "sent_at": m.sent_at,
+        }
+        for m in msgs
+    ]
+
+    return Response(
+        {
+            "study_status": study.status,
+            "data": data
+        },
+        status=200
+    )
+
+
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def send_chat_message(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    message_text = request.data.get("message_text", "").strip()
+    if not message_text:
+        return Response({"error": "message_text is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "Study not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # 🔥 NEW CONDITION
+    if should_close_chat(study, student):
+        ChatMessage.objects.filter(study=study).delete()
+        return Response(
+            {"error": "No active study"},
+            status=400
+        )
+
+    msg = ChatMessage.objects.create(
+        study=study,
+        sender=student,
+        message_text=message_text
+    )
+
+    return Response(
+        {
+            "message": "Message sent ✅",
+            "study_status": study.status,
+            "data": {
+                "message_id": msg.message_id,
+                "sender_id": msg.sender.student_id,
+                "sender_name": msg.sender.username,
+                "message_text": msg.message_text,
+                "sent_at": msg.sent_at,
+            }
+        },
+        status=201
+    )
+
+def auto_complete_study_if_expired(study):
+    if study.status not in ["Completed", "Cancelled"]:
+        if date.today() > study.end_date:
+            study.status = "Completed"
+            study.save()
+
+            # ✅ Free student skills
+            if study.student1_skill:
+                study.student1_skill.status = 1
+                study.student1_skill.save()
+
+            if study.student2_skill:
+                study.student2_skill.status = 1
+                study.student2_skill.save()
+
+            # ✅ RESET TEACHER
+            if study.teacher:
+                study.teacher.status = 0
+                study.teacher.save()
+
+            # ✅ Clear chat
+            ChatMessage.objects.filter(study=study).delete()
+
+@api_view(["GET"])
+def get_my_certificates(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    certificates = (
+        Certificate.objects
+        .filter(student=student)
+        .select_related("study")
+        .order_by("-issued_date")[:20]
+    )
+
+    data = []
+    for cert in certificates:
+        study = cert.study
+
+        # ✅ Identify correct StudentSkill
+        if student == study.student1:
+            skill_obj = study.student1_skill
+        else:
+            skill_obj = study.student2_skill
+
+        data.append({
+            "certificate_id": cert.certificate_id,
+            "student_name": student.username,
+            "department": student.department,
+            "skill": skill_obj.want if skill_obj else "-",
+            "level": skill_obj.level if skill_obj else "-",
+            "issued_date": cert.issued_date.date(),
+            "study_id": study.study_id,
+        })
+
+    return Response(data, status=200)
+@api_view(["GET"])
+def get_active_study_for_resource(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study = StudyConnection.objects.filter(
+        Q(student1=student) | Q(student2=student),
+        status="Progress"
+    ).order_by("-study_id").first()
+
+    if not study:
+        return Response({"exists": False}, status=200)
+
+    return Response({
+        "exists": True,
+        "study_id": study.study_id
+    }, status=200)
+@api_view(["POST"])
+@parser_classes([MultiPartParser, FormParser])
+def upload_resource(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+    file = request.FILES.get("file")
+
+    if not study_id or not file:
+        return Response({"error": "study_id and file required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(
+            study_id=study_id,
+            status="Progress"
+        )
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "No active study"}, status=400)
+
+    Resource.objects.create(
+        study=study,
+        uploaded_by=student,
+        file_name=file.name,
+        file_type=file.content_type,
+        file_path=file
+    )
+
+    return Response({"message": "Resource uploaded ✅"}, status=201)
+@api_view(["GET"])
+def get_partner_resources(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "Study not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    partner = study.student2 if study.student1 == student else study.student1
+
+    resources = Resource.objects.filter(
+        study=study,
+        uploaded_by=partner
+    ).order_by("-uploaded_at")
+
+    data = {
+        "partner_name": partner.username,
+        "resources": [
+            {
+                "file_name": r.file_name,
+                "file_type": r.file_type,
+                "file_url": request.build_absolute_uri(r.file_path.url),
+                "uploaded_at": r.uploaded_at,
+            }
+            for r in resources
+        ]
+    }
+
+    return Response(data, status=200)
+@api_view(["GET"])
+def get_my_studies(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    studies = (
+        StudyConnection.objects
+        .filter(Q(student1=student) | Q(student2=student))
+        .select_related("teacher", "student1_skill", "student2_skill")
+        .order_by("-study_id")
+    )
+
+    data = []
+    for s in studies:
+        partner = s.student2 if s.student1 == student else s.student1
+
+        # ✅ pick correct skill for THIS STUDY
+        skill = s.student1_skill if s.student1 == student else s.student2_skill
+
+        # 🔥 HARD FALLBACK: find skill created DURING this study
+        if not skill:
+            skill = (
+                StudentSkill.objects
+                .filter(student=student)
+                .order_by("-student_skill_id")
+                .first()
+            )
+
+        data.append({
+            "study_id": s.study_id,
+            "partner_name": partner.username,
+            "offer": skill.offer if skill else None,
+            "want": skill.want if skill else None,
+            "description": skill.description if skill else None,
+            "level": skill.level if skill else None,
+            "start_date": s.start_date,
+            "end_date": s.end_date,
+            "status": s.status,
+            "teacher_name": s.teacher.name if s.teacher else "Not Assigned",
+        })
+
+    return Response(data, status=200)
+
+# =========================
+# ✅ ALL RESOURCES GROUPED BY PARTNER (HISTORY + ACTIVE)
+# GET /api/resources/all/
+# =========================
+@api_view(["GET"])
+def get_all_resources_grouped(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    studies = StudyConnection.objects.filter(
+        Q(student1=student) | Q(student2=student)
+    ).select_related("student1", "student2")
+
+    partner_map = {}
+
+    for study in studies:
+        partner = study.student2 if study.student1 == student else study.student1
+
+        resources = Resource.objects.filter(
+            study=study,
+            uploaded_by=partner
+        ).order_by("-uploaded_at")
+
+        if not resources.exists():
+            continue
+
+        if partner.username not in partner_map:
+            partner_map[partner.username] = []
+
+        for r in resources:
+            partner_map[partner.username].append({
+                "file_name": r.file_name,
+                "file_type": r.file_type,
+                "file_url": request.build_absolute_uri(r.file_path.url),
+                "uploaded_at": r.uploaded_at,
+            })
+
+    return Response(
+        {
+            "partners": [
+                {
+                    "partner_name": name,
+                    "resources": files
+                }
+                for name, files in partner_map.items()
+            ]
+        },
+        status=200
+    )
+
+# =========================
+# SHARE SKILL (COLLEGE GROUP FEED)
+# =========================
+from datetime import timedelta
+from django.utils import timezone
+from rest_framework.parsers import JSONParser
+from rest_framework.decorators import api_view, parser_classes
+from rest_framework.response import Response
+
+from .models import SkillPost
+
+
+@api_view(["GET"])
+def get_skill_posts(request):
+    """
+    College-style group feed
+    Shows username + profile + message + time
+    Auto-cleans posts older than 30 days
+    """
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    # 🔥 Auto delete posts older than 30 days
+    expiry = timezone.now() - timedelta(days=30)
+    SkillPost.objects.filter(created_at__lt=expiry).delete()
+
+    posts = (
+        SkillPost.objects
+        .select_related("student")
+        .order_by("-created_at")
+    )
+
+    data = []
+    for p in posts:
+        data.append({
+            "post_id": p.post_id,
+            "message": p.message,
+            "created_at": p.created_at,  # frontend will format
+            "student": {
+                "username": p.student.username,
+                "profile": (
+                    request.build_absolute_uri(p.student.picture.url)
+                    if p.student.picture else None
+                )
+            }
+        })
+
+    return Response(data, status=200)
+
+
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def create_skill_post(request):
+    """
+    Create a new share-skill post
+    """
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    message = request.data.get("message", "").strip()
+    if not message:
+        return Response({"error": "Message is required"}, status=400)
+
+    SkillPost.objects.create(
+        student=student,
+        message=message
+    )
+
+    return Response({"message": "Post created ✅"}, status=201)
+@api_view(["GET"])
+def get_all_students_for_connect(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    students = Student.objects.exclude(student_id=student.student_id)
+
+    data = []
+    for s in students:
+        avg_rating = (
+            Rating.objects.filter(rated_to=s)
+            .aggregate(avg=Avg("rating_value"))["avg"] or 0
+        )
+
+        data.append({
+            "student_id": s.student_id,
+            "username": s.username,
+            "department": s.department,
+            "picture": request.build_absolute_uri(s.picture.url)
+            if s.picture else None,
+            "rating": round(avg_rating, 1),
+        })
+
+    return Response(data, status=200)
+import secrets
+from datetime import timedelta, date
+
+from django.utils import timezone
+from django.contrib.auth.hashers import check_password
+from django.db.models import Q, Avg
+
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from rest_framework.decorators import api_view, parser_classes
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.views import APIView
+
+from django.core.mail import send_mail
+from django.conf import settings
+
+from .models import (
+    Student,
+    StudyConnection,
+    Certificate,
+    StudentUploadedCertificate,
+    StudentSkill,
+    Rating,
+    Assessment,
+    Teacher,
+    ChatMessage,
+    Resource,
+    SkillPost
+)
+
+from .serializers import StudentSerializer, StudentSkillSerializer
+from admins.models import Admin
+
+
+
+# =========================
+# HELPERS
+# =========================
+def get_student_from_token(request):
+    auth = request.headers.get("Authorization")
+    if not auth:
+        return None
+    token = auth.replace("Bearer ", "").strip()
+    return Student.objects.filter(api_token=token).first()
+
+
+# =========================
+# AUTH
+# =========================
+@api_view(["POST"])
+def signup(request):
+    serializer = StudentSerializer(data=request.data)
+    if serializer.is_valid():
+        serializer.save()
+        return Response({"message": "Signup successful"})
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(["POST"])
+def check_unique(request):
+    email = request.data.get("email")
+    phone = request.data.get("phone_number")
+    errors = {}
+
+    if email and Student.objects.filter(email=email).exists():
+        errors["email"] = "Email already exists"
+
+    if phone and Student.objects.filter(phone_number=phone).exists():
+        errors["phone_number"] = "Phone number already exists"
+
+    return Response(errors)
+
+
+@api_view(["POST"])
+def login_view(request):
+    email = request.data.get("email")
+    password = request.data.get("password")
+
+    if not email or not password:
+        return Response({"error": "Email and password required"}, status=400)
+
+    # ---------- ADMIN LOGIN ----------
+    try:
+        admin = Admin.objects.get(email=email)
+        if check_password(password, admin.password):
+            token = secrets.token_hex(32)
+            admin.api_token = token
+            admin.save()
+            return Response({"role": "admin", "token": token, "admin_id": admin.admin_id})
+    except Admin.DoesNotExist:
+        pass
+
+    # ---------- STUDENT LOGIN ----------
+    try:
+        student = Student.objects.get(email=email)
+        if check_password(password, student.password):
+            token = secrets.token_hex(32)
+            student.api_token = token
+            student.save()
+            return Response({"role": "student", "token": token, "student_id": student.student_id})
+    except Student.DoesNotExist:
+        pass
+
+    return Response({"error": "Invalid credentials"}, status=401)
+
+
+@api_view(["POST"])
+def logout(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    student.api_token = None
+    student.save()
+    return Response({"message": "Logged out successfully"})
+
+
+# =========================
+# DASHBOARD ✅ FIXED
+# =========================
+# =========================
+# DASHBOARD ✅ FIXED
+# =========================
+class StudentDashboardView(APIView):
+    def get(self, request):
+        student = get_student_from_token(request)
+        if not student:
+            return Response({"error": "Unauthorized"}, status=401)
+
+        # ================= ACTIVE STUDY =================
+        active = StudyConnection.objects.filter(
+            Q(student1=student) | Q(student2=student),
+            status__in=["Started", "Progress"],
+        ).order_by("-study_id").first()
+
+        active_data = None
+        if active:
+            partner = (
+                active.student2.username
+                if active.student1 == student
+                else active.student1.username
+            )
+
+            # ✅ FIRST try linked skill
+            my_skill = (
+                active.student1_skill
+                if active.student1 == student
+                else active.student2_skill
+            )
+
+            # 🔥 FALLBACK: get latest skill if not linked
+            if not my_skill:
+                my_skill = (
+                    StudentSkill.objects
+                    .filter(student=student)
+                    .order_by("-student_skill_id")
+                    .first()
+                )
+
+            active_data = {
+                "study_id": active.study_id,
+                "partner": partner,
+                "offer": my_skill.offer if my_skill else None,
+                "want": my_skill.want if my_skill else None,
+                "level": my_skill.level if my_skill else None,
+                "status": active.status,
+                "start_date": active.start_date,
+                "end_date": active.end_date,
+                "teacher_name": active.teacher.name if active.teacher else None,
+            }
+
+        # ================= HISTORY =================
+        history_qs = StudyConnection.objects.filter(
+            Q(student1=student) | Q(student2=student),
+            status__in=["Completed", "Cancelled"]
+        ).order_by("-study_id")
+
+        completed_count = history_qs.filter(status="Completed").count()
+        cancelled_count = history_qs.filter(status="Cancelled").count()
+
+        history_qs = history_qs[:5]
+
+        history_data = []
+        for s in history_qs:
+            partner = s.student2 if s.student1 == student else s.student1
+
+            skill = (
+                s.student1_skill
+                if s.student1 == student
+                else s.student2_skill
+            )
+
+            # 🔥 fallback for history too
+            if not skill:
+                skill = (
+                    StudentSkill.objects
+                    .filter(student=student)
+                    .order_by("-student_skill_id")
+                    .first()
+                )
+
+            history_data.append({
+                "study_id": s.study_id,
+                "partner": partner.username,
+                "offer_skill": skill.offer if skill else None,
+                "want_skill": skill.want if skill else None,
+                "status": s.status,
+                "start_date": s.start_date,
+                "end_date": s.end_date,
+            })
+
+        return Response({
+            "username": student.username,
+            "active_study": active_data,
+            "history": history_data,
+            "completed_skills": completed_count,
+            "cancelled_studies": cancelled_count,
+            "certificates": Certificate.objects.filter(student=student).count(),
+        }, status=200)
+
+
+
+# =========================
+# ✅ NEW API: GET MY LEVEL + PARTNER LEVEL (Form.jsx needs this)
+# GET /api/study/my-level/<study_id>/
+# =========================
+@api_view(["GET"])
+def get_my_study_level(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "StudyConnection not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    if student == study.student1:
+        my_skill = study.student1_skill
+        partner_skill = study.student2_skill
+        role = "student1"
+    else:
+        my_skill = study.student2_skill
+        partner_skill = study.student1_skill
+        role = "student2"
+
+    my_level = my_skill.level if my_skill else "Basic"
+    partner_level = partner_skill.level if partner_skill else "Basic"
+
+    return Response({
+        "study_id": study.study_id,
+        "role": role,
+        "my_level": my_level,
+        "partner_level": partner_level,
+    }, status=200)
+
+
+# =========================
+# UPDATE STUDY STATUS
+# =========================
+@api_view(["POST"])
+def update_study_status(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    status_value = request.data.get("status")
+
+    if status_value not in ["Completed", "Cancelled"]:
+        return Response({"error": "Invalid status"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "StudyConnection not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # =========================
+    # UPDATE STUDY STATUS
+    # =========================
+    study.status = status_value
+    study.save()
+
+    # =========================
+    # FREE STUDENT SKILLS
+    # =========================
+    if status_value == "Completed":
+        if study.student1_skill:
+            study.student1_skill.status = 0
+            study.student1_skill.save()
+
+        if study.student2_skill:
+            study.student2_skill.status = 0
+            study.student2_skill.save()
+
+    # =========================
+    # 🔥 RESET TEACHER STATUS
+    # =========================
+    if study.teacher:
+        study.teacher.status = 0
+        study.teacher.save()
+        study.teacher = None
+        study.save(update_fields=["teacher"])
+
+    return Response(
+        {
+            "message": f"Study marked as {status_value} ✅",
+            "study_id": study.study_id
+        },
+        status=200
+    )
+
+# =========================
+# PROFILE (GET / PUT / DELETE)
+# =========================
+@api_view(["GET", "PUT", "DELETE"])
+@parser_classes([MultiPartParser, FormParser, JSONParser])
+def my_student_profile(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    if request.method == "GET":
+        serializer = StudentSerializer(student)
+        data = serializer.data
+
+        data["uploaded_certificates"] = [
+            {"id": cert.id, "file": request.build_absolute_uri(cert.file.url)}
+            for cert in student.uploaded_certificates.all()
+        ]
+        return Response(data)
+
+    if request.method == "PUT":
+        serializer = StudentSerializer(student, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        for file in request.FILES.getlist("uploaded_certificates"):
+            StudentUploadedCertificate.objects.create(student=student, file=file)
+
+        serializer = StudentSerializer(student)
+        data = serializer.data
+        data["uploaded_certificates"] = [
+            {"id": cert.id, "file": request.build_absolute_uri(cert.file.url)}
+            for cert in student.uploaded_certificates.all()
+        ]
+        return Response(data, status=200)
+
+    if request.method == "DELETE":
+        cert_id = request.data.get("certificate_id")
+        if not cert_id:
+            return Response({"error": "certificate_id required"}, status=400)
+
+        try:
+            cert = StudentUploadedCertificate.objects.get(id=cert_id, student=student)
+            cert.delete()
+            return Response({"message": "Certificate deleted ✅"}, status=200)
+        except StudentUploadedCertificate.DoesNotExist:
+            return Response({"error": "Certificate not found"}, status=404)
+
+
+# =========================
+# CHECK STUDENT ELIGIBILITY
+# =========================
+@api_view(["GET"])
+def check_student_eligibility(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_ok = StudyConnection.objects.filter(
+        Q(student1=student) | Q(student2=student),
+        status__in=["Completed", "Cancelled"]
+    ).exists()
+
+    assessment_ok = Assessment.objects.filter(
+        student=student,
+        status__in=["Completed", "Cancelled"]
+    ).exists()
+
+    return Response({"study_ok": study_ok, "assessment_ok": assessment_ok})
+
+
+# =========================
+# GET LATEST SKILL
+# =========================
+@api_view(["GET"])
+def get_latest_skill(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    latest_skill = StudentSkill.objects.filter(student=student).order_by("-student_skill_id").first()
+
+    if not latest_skill:
+        return Response({"exists": False})
+
+    return Response({
+        "exists": True,
+        "student_skill_id": latest_skill.student_skill_id,
+        "offer": latest_skill.offer,
+        "want": latest_skill.want,
+        "level": latest_skill.level,
+        "status": latest_skill.status,
+    })
+
+
+@api_view(["GET"])
+def get_latest_pending_skill(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    skill = StudentSkill.objects.filter(student=student, status=0).order_by("-student_skill_id").first()
+    if not skill:
+        return Response({"exists": False})
+
+    return Response({
+        "exists": True,
+        "student_skill_id": skill.student_skill_id,
+        "offer": skill.offer,
+        "want": skill.want,
+        "level": skill.level,
+        "status": skill.status,
+    })
+
+
+# =========================
+# STUDENT SKILL
+# =========================
+# =========================
+# STUDENT SKILL
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def student_skill_create_list(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+
+    def clean(v):
+        return v.strip() if v and v.strip() else None
+
+    offer = clean(request.data.get("offer"))
+    want = clean(request.data.get("want"))
+    description = clean(request.data.get("description"))
+    level = request.data.get("level", "Basic")
+
+    # ✅ CREATE / UPDATE PENDING SKILL
+    skill, _ = StudentSkill.objects.update_or_create(
+        student=student,
+        status=0,
+        defaults={
+            "offer": offer,
+            "want": want,
+            "description": description,
+            "level": level,
+        }
+    )
+
+    # 🔥🔥🔥 LINK SKILL TO STUDY (THIS WAS MISSING)
+    if study_id:
+        try:
+            study = StudyConnection.objects.get(study_id=study_id)
+            if study.student1 == student:
+                study.student1_skill = skill
+            elif study.student2 == student:
+                study.student2_skill = skill
+            study.save()
+        except StudyConnection.DoesNotExist:
+            pass
+
+    return Response(
+        {
+            "message": "Skill saved & linked to study ✅",
+            "offer": skill.offer,
+            "want": skill.want,
+        },
+        status=200
+    )
+
+
+
+
+
+# =========================
+# MATCHES
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def student_skill_matches(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    offer = request.data.get("offer")
+    want = request.data.get("want")
+
+    if not offer or not want:
+        return Response({"error": "offer and want required"}, status=400)
+
+    matches = StudentSkill.objects.filter(
+        offer__isnull=False,
+        want__isnull=False,
+        status=0,
+        offer__iexact=want,
+        want__iexact=offer,
+    ).exclude(student=student)
+
+    available = []
+    for m in matches:
+        busy = StudyConnection.objects.filter(
+            Q(student1=m.student) | Q(student2=m.student),
+            status__in=["Started", "Progress"]
+        ).exists()
+
+        if not busy:
+            available.append(m)
+
+    seen = set()
+    data = []
+    for m in available:
+        if m.student_id in seen:
+            continue
+        seen.add(m.student_id)
+
+        avg_rating = Rating.objects.filter(
+            rated_to=m.student
+        ).aggregate(avg=Avg("rating_value"))["avg"] or 0
+
+        data.append({
+            "student_id": m.student.student_id,
+            "username": m.student.username,
+            "picture": request.build_absolute_uri(m.student.picture.url)
+            if m.student.picture else None,
+            "offer": m.offer,
+            "want": m.want,
+            "level": m.level,
+            "rating": round(avg_rating, 1),
+        })
+
+    return Response(sorted(data, key=lambda x: x["rating"], reverse=True), status=200)
+
+
+# =========================
+# STUDENT DETAIL
+# =========================
+@api_view(["GET"])
+def get_student_detail(request, student_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    try:
+        s = Student.objects.get(student_id=student_id)
+    except Student.DoesNotExist:
+        return Response({"error": "Student not found"}, status=404)
+
+    certificates = [
+        {
+            "id": cert.id,
+            "file": request.build_absolute_uri(cert.file.url),
+            "uploaded_at": cert.uploaded_at,
+        }
+        for cert in s.uploaded_certificates.all()
+    ]
+
+    data = {
+        "student_id": s.student_id,
+        "username": s.username,
+        "department": s.department,
+        "year": s.year,
+        "about_me": s.about_me,
+        "skills": s.skills,
+        "picture": request.build_absolute_uri(s.picture.url) if s.picture else None,
+        "certificates": certificates,  # ✅ NEW
+    }
+
+    return Response(data, status=200)
+
+
+# =========================
+# CREATE STUDY CONNECTION
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def create_studyconnection(request):
+    student1 = get_student_from_token(request)
+    if not student1:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    student2_id = request.data.get("student2_id")
+    if not student2_id:
+        return Response({"error": "student2_id is required"}, status=400)
+
+    try:
+        student2 = Student.objects.get(student_id=student2_id)
+    except Student.DoesNotExist:
+        return Response({"error": "Student not found"}, status=404)
+
+    # ❌ BLOCK if logged-in student has ACTIVE study
+    active_me = StudyConnection.objects.filter(
+        Q(student1=student1) | Q(student2=student1),
+        status__in=["Started", "Progress"]
+    ).exists()
+
+    if active_me:
+        return Response(
+            {"error": "Complete your current study before connecting ❌"},
+            status=400
+        )
+
+    # ❌ BLOCK if selected student has ACTIVE study
+    active_other = StudyConnection.objects.filter(
+        Q(student1=student2) | Q(student2=student2),
+        status__in=["Started", "Progress"]
+    ).exists()
+
+    if active_other:
+        return Response(
+            {"error": "This student is already connected ❌"},
+            status=400
+        )
+
+    # ✅ Get latest pending skills (OPTIONAL, NOT MATCHED)
+    student1_skill = StudentSkill.objects.filter(
+        student=student1,
+        status=0
+    ).order_by("-student_skill_id").first()
+
+    student2_skill = StudentSkill.objects.filter(
+        student=student2,
+        status=0
+    ).order_by("-student_skill_id").first()
+
+    # ❌ Skill matching REMOVED COMPLETELY
+
+    start_date = timezone.now().date()
+    end_date = start_date + timedelta(days=7)
+
+    study = StudyConnection.objects.create(
+        student1=student1,
+        student2=student2,
+        student1_skill=student1_skill,  # may be NULL
+        student2_skill=student2_skill,  # may be NULL
+        start_date=start_date,
+        end_date=end_date,
+        status="Started"
+    )
+
+    return Response(
+        {
+            "message": "Study connection created ✅",
+            "study_id": study.study_id
+        },
+        status=201
+    )
+
+
+
+# =========================
+# TEACHER LIST
+# =========================
+@api_view(["GET"])
+def teacher_list(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    q = request.GET.get("q", "").strip()
+    department = request.GET.get("department", "").strip()
+
+    teachers = Teacher.objects.filter(status=0)
+
+    if q:
+        teachers = teachers.filter(name__icontains=q)
+
+    if department:
+        teachers = teachers.filter(department__iexact=department)
+
+    teachers = teachers.order_by("name")
+
+    data = []
+    for t in teachers:
+        data.append({
+            "teacher_id": t.teacher_id,
+            "name": t.name,
+            "email": t.email,
+            "department": t.department,
+            "profile": request.build_absolute_uri(t.profile.url) if t.profile else None,
+        })
+
+    return Response(data, status=200)
+
+
+# =========================
+# SELECT TEACHER FOR STUDY
+# =========================
+# =========================
+# SELECT / UPDATE TEACHER ✅ FIXED
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def select_teacher_for_study(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    teacher_id = request.data.get("teacher_id")
+    if not teacher_id:
+        return Response({"error": "teacher_id is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "Study not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # ✅ RESET OLD TEACHER
+    if study.teacher:
+        old_teacher = study.teacher
+        old_teacher.status = 0
+        old_teacher.save()
+
+    try:
+        new_teacher = Teacher.objects.get(teacher_id=teacher_id)
+    except Teacher.DoesNotExist:
+        return Response({"error": "Teacher not found"}, status=404)
+
+    # ✅ ASSIGN NEW TEACHER
+    new_teacher.status = 1
+    new_teacher.save()
+
+    study.teacher = new_teacher
+    study.save()
+
+    # ✅ EMAIL
+    send_mail(
+        subject="Mentor Assigned - ELAVRE",
+        message=f"""
+Hello {new_teacher.name},
+
+You have been assigned as mentor.
+
+Study ID: {study.study_id}
+Student: {student.username}
+
+Thank you,
+ELAVRE Team
+""",
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=[new_teacher.email],
+        fail_silently=True,
+    )
+
+    return Response(
+        {
+            "message": "Teacher updated successfully ✅",
+            "teacher_name": new_teacher.name
+        },
+        status=200
+    )
+
+
+# =========================
+# GET SELECTED TEACHER
+# =========================
+@api_view(["GET"])
+def get_selected_teacher(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "StudyConnection not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    if not study.teacher:
+        return Response({"teacher": None}, status=200)
+
+    t = study.teacher
+    return Response({
+        "teacher": {
+            "teacher_id": t.teacher_id,
+            "name": t.name,
+            "email": t.email,
+            "department": t.department,
+            "profile": request.build_absolute_uri(t.profile.url) if t.profile else None,
+        }
+    }, status=200)
+
+
+# =========================
+# UPDATE END DATE
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def update_study_enddate(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    end_date = request.data.get("end_date")
+    if not end_date:
+        return Response({"error": "end_date is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "StudyConnection not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    study.end_date = end_date
+    study.save()
+
+    return Response({"message": "End date updated ✅"}, status=200)
+
+
+# =========================
+# ✅ CREATE ASSESSMENT FOR BOTH (NO assessment_type/title)
+# POST /api/assessment/create/
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def create_assessment_for_both(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+    if not study_id:
+        return Response({"error": "study_id is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "Study not found"}, status=404)
+
+    # ❌ Security check
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # ✅ Get correct skill for logged-in student
+    skill = (
+        study.student1_skill
+        if study.student1 == student
+        else study.student2_skill
+    )
+
+    # ❌ NO OFFER + NO WANT → DO NOTHING
+    if not skill or (not skill.offer and not skill.want):
+        return Response(
+            {"message": "No skills provided. Assessment not required."},
+            status=200
+        )
+
+    # =========================
+    # CREATE ASSESSMENTS (NO DUPLICATES)
+    # =========================
+    # ✅ Create for Student 1 if they learn something
+    if study.student1_skill and study.student1_skill.want and study.student1_skill.want.lower() != "none":
+        Assessment.objects.get_or_create(
+            study=study,
+            student=study.student1
+        )
+
+    # ✅ Create for Student 2 if they learn something
+    if study.student2_skill and study.student2_skill.want and study.student2_skill.want.lower() != "none":
+        Assessment.objects.get_or_create(
+            study=study,
+            student=study.student2
+        )
+
+    # =========================
+    # MOVE STUDY → PROGRESS (ONLY ONCE)
+    # =========================
+    if study.status != "Progress":
+        study.status = "Progress"
+        study.save(update_fields=["status"])
+
+    return Response(
+        {
+            "message": "Assessment created ✅",
+            "study_status": study.status
+        },
+        status=201
+    )
+
+
+
+
+# =========================
+# UPLOAD VALIDATION FORM FILE
+# =========================
+
+
+# =========================
+# ✅ CREATE ASSESSMENT FOR BOTH
+# POST /api/assessment/create-for-both/
+# =========================
+
+# =========================
+# ✅ UPLOAD VALIDATION FORM FILE
+# POST /api/assessment/upload-validation-form/
+# =========================
+@api_view(["POST"])
+@parser_classes([MultiPartParser, FormParser])
+def upload_validation_form(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+    file = request.FILES.get("validation_form_file")
+
+    if not study_id:
+        return Response({"error": "study_id is required"}, status=400)
+
+    if not file:
+        return Response({"error": "validation_form_file is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "StudyConnection not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    assessment, _ = Assessment.objects.get_or_create(study=study, student=student)
+    assessment.validation_form_file = file
+    assessment.save()
+
+    return Response({"message": "Validation form uploaded ✅"}, status=200)
+
+
+# =========================
+# ✅ ASSESSMENT STATUS
+# GET /api/assessment/status/
+# =========================
+@api_view(["GET"])
+def assessment_status(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    # 🔥 0️⃣ Check if most recent StudyConnection is COMPLETED
+    from django.db.models import Q
+    recent_study = StudyConnection.objects.filter(
+        Q(student1=student) | Q(student2=student)
+    ).order_by("-created_at").first()
+
+    if recent_study and recent_study.status != "Completed":
+        return Response(
+            {
+                "eligible": False,
+                "message": "Your current study connection must be completed first 🚫"
+            },
+            status=200
+        )
+
+    # 🔥 1️⃣ Get FIRST pending assessment (Submitted)
+    pending = (
+        Assessment.objects
+        .filter(student=student, status="Submitted")
+        .order_by("assessment_id")
+        .first()
+    )
+
+    if not pending:
+        return Response(
+            {
+                "eligible": False,
+                "message": "You have no pending assessments 🎉"
+            },
+            status=200
+        )
+
+    study = pending.study
+    partner = study.student2 if study.student1 == student else study.student1
+
+    # get correct skill
+    my_skill = (
+        study.student1_skill if study.student1 == student
+        else study.student2_skill
+    )
+
+    return Response(
+        {
+            "eligible": True,
+            "assessment_id": pending.assessment_id,
+            "study_id": study.study_id,
+            "my_level": my_skill.level if my_skill else "Basic",
+            "partner_id": partner.student_id,
+            "partner_name": partner.username,
+            "teacher_name": study.teacher.name if study.teacher else None,
+        },
+        status=200
+    )
+
+
+
+# =========================
+# ✅ SUBMIT ASSESSMENT (Upload ALL)
+# POST /api/assessment/submit/
+# =========================
+@api_view(["POST"])
+@parser_classes([MultiPartParser, FormParser])
+def submit_assessment(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+    if not study_id:
+        return Response({"error": "study_id is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "StudyConnection not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # ✅ SKIP if no 'want' skill (Mentor Role)
+    my_skill = study.student1_skill if study.student1 == student else study.student2_skill
+    if not my_skill or not my_skill.want or my_skill.want.lower() == "none":
+        return Response({"error": "Assessment not required for your role"}, status=400)
+
+    # =========================
+    # SAVE / UPDATE ASSESSMENT
+    # =========================
+    assessment, _ = Assessment.objects.get_or_create(
+        study=study,
+        student=student
+    )
+
+    project_title = request.data.get("project_title")
+    assessment_work = request.data.get("assessment_work")
+
+    if project_title:
+        assessment.project_title = project_title
+
+    if assessment_work:
+        assessment.assessment_work = assessment_work
+
+    if "assessment_file" in request.FILES:
+        assessment.assessment_file = request.FILES["assessment_file"]
+
+    if "validation_form_file" in request.FILES:
+        assessment.validation_form_file = request.FILES["validation_form_file"]
+
+    assessment.status = "Completed"
+    assessment.save()
+
+    # =========================
+    # COMPLETE STUDY
+    # =========================
+    study.status = "Completed"
+    study.save()
+
+    # =========================
+    # ✅ ADDITION: MARK STUDENT SKILLS AS COMPLETED
+    # =========================
+    if study.student1_skill:
+        study.student1_skill.status = 1
+        study.student1_skill.save(update_fields=["status"])
+
+    if study.student2_skill:
+        study.student2_skill.status = 1
+        study.student2_skill.save(update_fields=["status"])
+
+    # =========================
+    # ISSUE CERTIFICATE (NO DUPLICATION ✅)
+    # =========================
+    Certificate.objects.get_or_create(
+        student=student,
+        study=study
+    )
+
+    # =========================
+    # EMAIL TEACHER (OPTIONAL)
+    # =========================
+    if study.teacher:
+        send_mail(
+            subject="Skill Completion - Assessment Completed (ELAVRE)",
+            message=f"""
+Hello {study.teacher.name},
+
+Student {student.username} has successfully completed the assessment.
+
+Study ID: {study.study_id}
+Project Title: {assessment.project_title or "-"}
+Assessment Work: {assessment.assessment_work or "-"}
+
+Certificate has been issued automatically.
+
+Thank you,
+ELAVRE Team
+""",
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[study.teacher.email],
+            fail_silently=True,
+        )
+
+    return Response(
+        {
+            "message": "Assessment completed ✅ Certificate issued 🎓"
+        },
+        status=200
+    )
+
+
+
+
+# =========================
+# ✅ SAVE RATING
+# POST /api/rating/save/
+# =========================
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def save_rating(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+    rating_value = request.data.get("rating_value")
+
+    if not study_id or not rating_value:
+        return Response({"error": "study_id and rating_value required"}, status=400)
+
+    try:
+        rating_value = int(rating_value)
+    except:
+        return Response({"error": "rating_value must be number"}, status=400)
+
+    if rating_value < 1 or rating_value > 5:
+        return Response({"error": "rating_value must be 1-5"}, status=400)
+
+    study = StudyConnection.objects.filter(study_id=study_id).first()
+    if not study:
+        return Response({"error": "Study not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    partner = study.student2 if study.student1 == student else study.student1
+
+    Rating.objects.update_or_create(
+        study=study,
+        rated_by=student,
+        rated_to=partner,
+        defaults={"rating_value": rating_value},
+    )
+
+    return Response({"message": "Rating saved ✅"}, status=200)
+
+
+
+# =========================
+# CHAT MESSAGES
+# =========================
+@api_view(["GET"])
+def get_chat_messages(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "Study not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # 🔥 NEW CONDITION
+    if should_close_chat(study, student):
+        ChatMessage.objects.filter(study=study).delete()
+
+        return Response(
+            {
+                "message": "No active study",
+                "study_status": study.status,
+                "data": [],
+            },
+            status=200
+        )
+
+    msgs = ChatMessage.objects.filter(study=study).order_by("sent_at")
+
+    data = [
+        {
+            "message_id": m.message_id,
+            "sender_id": m.sender.student_id,
+            "sender_name": m.sender.username,
+            "message_text": m.message_text,
+            "sent_at": m.sent_at,
+        }
+        for m in msgs
+    ]
+
+    return Response(
+        {
+            "study_status": study.status,
+            "data": data
+        },
+        status=200
+    )
+
+
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def send_chat_message(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    message_text = request.data.get("message_text", "").strip()
+    if not message_text:
+        return Response({"error": "message_text is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "Study not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # 🔥 NEW CONDITION
+    if should_close_chat(study, student):
+        ChatMessage.objects.filter(study=study).delete()
+        return Response(
+            {"error": "No active study"},
+            status=400
+        )
+
+    msg = ChatMessage.objects.create(
+        study=study,
+        sender=student,
+        message_text=message_text
+    )
+
+    return Response(
+        {
+            "message": "Message sent ✅",
+            "study_status": study.status,
+            "data": {
+                "message_id": msg.message_id,
+                "sender_id": msg.sender.student_id,
+                "sender_name": msg.sender.username,
+                "message_text": msg.message_text,
+                "sent_at": msg.sent_at,
+            }
+        },
+        status=201
+    )
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def send_chat_message(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    message_text = request.data.get("message_text", "").strip()
+    if not message_text:
+        return Response({"error": "message_text is required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "Study not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    # =========================
+    # 🔥 AUTO COMPLETE IF EXPIRED
+    # =========================
+    auto_complete_study_if_expired(study)
+
+    # =========================
+    # 🔥 CLOSE CHAT CONDITION
+    # =========================
+    if should_close_chat(study, student):
+        ChatMessage.objects.filter(study=study).delete()
+        return Response(
+            {"error": "No active study"},
+            status=400
+        )
+
+    # =========================
+    # CREATE MESSAGE
+    # =========================
+    msg = ChatMessage.objects.create(
+        study=study,
+        sender=student,
+        message_text=message_text
+    )
+
+    return Response(
+        {
+            "message": "Message sent ✅",
+            "study_status": study.status,
+            "data": {
+                "message_id": msg.message_id,
+                "sender_id": msg.sender.student_id,
+                "sender_name": msg.sender.username,
+                "message_text": msg.message_text,
+                "sent_at": msg.sent_at,
+            }
+        },
+        status=201
+    )
+
+def auto_complete_study_if_expired(study):
+    if study.status not in ["Completed", "Cancelled"]:
+        if date.today() > study.end_date:
+            study.status = "Completed"
+            study.save()
+
+            # ✅ Free student skills
+            if study.student1_skill:
+                study.student1_skill.status = 1
+                study.student1_skill.save()
+
+            if study.student2_skill:
+                study.student2_skill.status = 1
+                study.student2_skill.save()
+
+            # ✅ RESET TEACHER
+            if study.teacher:
+                study.teacher.status = 0
+                study.teacher.save()
+
+            # ✅ Clear chat
+            ChatMessage.objects.filter(study=study).delete()
+
+@api_view(["GET"])
+def get_my_certificates(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    certificates = (
+        Certificate.objects
+        .filter(student=student)
+        .select_related("study")
+        .order_by("-issued_date")[:20]
+    )
+
+    data = []
+    for cert in certificates:
+        study = cert.study
+
+        # ✅ Identify correct StudentSkill
+        if student == study.student1:
+            skill_obj = study.student1_skill
+        else:
+            skill_obj = study.student2_skill
+
+        data.append({
+            "certificate_id": cert.certificate_id,
+            "student_name": student.username,
+            "department": student.department,
+            "skill": skill_obj.want if skill_obj else "-",
+            "level": skill_obj.level if skill_obj else "-",
+            "issued_date": cert.issued_date.date(),
+            "study_id": study.study_id,
+        })
+
+    return Response(data, status=200)
+@api_view(["GET"])
+def get_active_study_for_resource(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study = StudyConnection.objects.filter(
+        Q(student1=student) | Q(student2=student),
+        status="Progress"
+    ).order_by("-study_id").first()
+
+    if not study:
+        return Response({"exists": False}, status=200)
+
+    return Response({
+        "exists": True,
+        "study_id": study.study_id
+    }, status=200)
+@api_view(["POST"])
+@parser_classes([MultiPartParser, FormParser])
+def upload_resource(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+    file = request.FILES.get("file")
+
+    if not study_id or not file:
+        return Response({"error": "study_id and file required"}, status=400)
+
+    try:
+        study = StudyConnection.objects.get(
+            study_id=study_id,
+            status="Progress"
+        )
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "No active study"}, status=400)
+
+    Resource.objects.create(
+        study=study,
+        uploaded_by=student,
+        file_name=file.name,
+        file_type=file.content_type,
+        file_path=file
+    )
+
+    return Response({"message": "Resource uploaded ✅"}, status=201)
+@api_view(["GET"])
+def get_partner_resources(request, study_id):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    try:
+        study = StudyConnection.objects.get(study_id=study_id)
+    except StudyConnection.DoesNotExist:
+        return Response({"error": "Study not found"}, status=404)
+
+    if student not in [study.student1, study.student2]:
+        return Response({"error": "Forbidden"}, status=403)
+
+    partner = study.student2 if study.student1 == student else study.student1
+
+    resources = Resource.objects.filter(
+        study=study,
+        uploaded_by=partner
+    ).order_by("-uploaded_at")
+
+    data = {
+        "partner_name": partner.username,
+        "resources": [
+            {
+                "file_name": r.file_name,
+                "file_type": r.file_type,
+                "file_url": request.build_absolute_uri(r.file_path.url),
+                "uploaded_at": r.uploaded_at,
+            }
+            for r in resources
+        ]
+    }
+
+    return Response(data, status=200)
+@api_view(["GET"])
+def get_my_studies(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    studies = (
+        StudyConnection.objects
+        .filter(Q(student1=student) | Q(student2=student))
+        .select_related("teacher", "student1_skill", "student2_skill")
+        .order_by("-study_id")
+    )
+
+    data = []
+    for s in studies:
+        partner = s.student2 if s.student1 == student else s.student1
+
+        # ✅ pick correct skill for THIS STUDY
+        skill = s.student1_skill if s.student1 == student else s.student2_skill
+
+        # 🔥 HARD FALLBACK: find skill created DURING this study
+        if not skill:
+            skill = (
+                StudentSkill.objects
+                .filter(student=student)
+                .order_by("-student_skill_id")
+                .first()
+            )
+
+        data.append({
+            "study_id": s.study_id,
+            "partner_name": partner.username,
+            "offer": skill.offer if skill else None,
+            "want": skill.want if skill else None,
+            "description": skill.description if skill else None,
+            "level": skill.level if skill else None,
+            "start_date": s.start_date,
+            "end_date": s.end_date,
+            "status": s.status,
+            "teacher_name": s.teacher.name if s.teacher else "Not Assigned",
+        })
+
+    return Response(data, status=200)
+
+# =========================
+# ✅ ALL RESOURCES GROUPED BY PARTNER (HISTORY + ACTIVE)
+# GET /api/resources/all/
+# =========================
+@api_view(["GET"])
+def get_all_resources_grouped(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    studies = StudyConnection.objects.filter(
+        Q(student1=student) | Q(student2=student)
+    ).select_related("student1", "student2")
+
+    partner_map = {}
+
+    for study in studies:
+        partner = study.student2 if study.student1 == student else study.student1
+
+        resources = Resource.objects.filter(
+            study=study,
+            uploaded_by=partner
+        ).order_by("-uploaded_at")
+
+        if not resources.exists():
+            continue
+
+        if partner.username not in partner_map:
+            partner_map[partner.username] = []
+
+        for r in resources:
+            partner_map[partner.username].append({
+                "file_name": r.file_name,
+                "file_type": r.file_type,
+                "file_url": request.build_absolute_uri(r.file_path.url),
+                "uploaded_at": r.uploaded_at,
+            })
+
+    return Response(
+        {
+            "partners": [
+                {
+                    "partner_name": name,
+                    "resources": files
+                }
+                for name, files in partner_map.items()
+            ]
+        },
+        status=200
+    )
+
+# =========================
+# SHARE SKILL (COLLEGE GROUP FEED)
+# =========================
+from datetime import timedelta
+from django.utils import timezone
+from rest_framework.parsers import JSONParser
+from rest_framework.decorators import api_view, parser_classes
+from rest_framework.response import Response
+
+from .models import SkillPost
+
+
+@api_view(["GET"])
+def get_skill_posts(request):
+    """
+    College-style group feed
+    Shows username + profile + message + time
+    Auto-cleans posts older than 30 days
+    """
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    # 🔥 Auto delete posts older than 30 days
+    expiry = timezone.now() - timedelta(days=30)
+    SkillPost.objects.filter(created_at__lt=expiry).delete()
+
+    posts = (
+        SkillPost.objects
+        .select_related("student")
+        .order_by("-created_at")
+    )
+
+    data = []
+    for p in posts:
+        data.append({
+            "post_id": p.post_id,
+            "message": p.message,
+            "created_at": p.created_at,  # frontend will format
+            "student": {
+                "username": p.student.username,
+                "profile": (
+                    request.build_absolute_uri(p.student.picture.url)
+                    if p.student.picture else None
+                )
+            }
+        })
+
+    return Response(data, status=200)
+
+
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def create_skill_post(request):
+    """
+    Create a new share-skill post
+    """
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    message = request.data.get("message", "").strip()
+    if not message:
+        return Response({"error": "Message is required"}, status=400)
+
+    SkillPost.objects.create(
+        student=student,
+        message=message
+    )
+
+    # 📧 Send email notification to all students
+    try:
+        all_students = Student.objects.exclude(student_id=student.student_id)
+        recipient_emails = [s.email for s in all_students if s.email]
+        
+        if recipient_emails:
+            send_mail(
+                subject=f"New Skill Post from {student.username} - Elevare",
+                message=f"{student.username} shared a new skill:\n\n{message}\n\nLogin to Elevare to view and respond!",
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=recipient_emails,
+                fail_silently=True,
+            )
+    except Exception as e:
+        # Log error but don't fail the post creation
+        print(f"Email notification failed: {str(e)}")
+
+    return Response({"message": "Post created ✅"}, status=201)
+@api_view(["GET"])
+def get_all_students_for_connect(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    students = Student.objects.exclude(student_id=student.student_id)
+
+    data = []
+    for s in students:
+        avg_rating = (
+            Rating.objects.filter(rated_to=s)
+            .aggregate(avg=Avg("rating_value"))["avg"] or 0
+        )
+
+        data.append({
+            "student_id": s.student_id,
+            "username": s.username,
+            "department": s.department,
+            "picture": request.build_absolute_uri(s.picture.url)
+            if s.picture else None,
+            "rating": round(avg_rating, 1),
+        })
+
+    return Response(data, status=200)
+@api_view(["POST"])
+@parser_classes([JSONParser])
+def student_skill_create_list(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study_id = request.data.get("study_id")
+
+    def clean(v):
+        return v.strip() if v and v.strip() else None
+
+    offer = clean(request.data.get("offer"))
+    want = clean(request.data.get("want"))
+    description = clean(request.data.get("description"))
+    level = request.data.get("level", "Basic")
+
+    # =========================
+    # CREATE / UPDATE PENDING SKILL
+    # =========================
+    skill, _ = StudentSkill.objects.update_or_create(
+        student=student,
+        status=0,
+        defaults={
+            "offer": offer,
+            "want": want,
+            "description": description,
+            "level": level,
+        }
+    )
+
+    # =========================
+    # 🔥 SMART LINK SKILL TO STUDY
+    # =========================
+    if study_id:
+        try:
+            study = StudyConnection.objects.get(study_id=study_id)
+
+            # BOTH NULL → first fills student1
+            if not study.student1_skill and not study.student2_skill:
+                study.student1_skill = skill
+
+            # student1 exists, student2 null
+            elif study.student1_skill and not study.student2_skill:
+                if study.student1 == student:
+                    study.student1_skill = skill
+                else:
+                    study.student2_skill = skill
+
+            # student1 null, student2 exists
+            elif not study.student1_skill and study.student2_skill:
+                if study.student2 == student:
+                    study.student2_skill = skill
+                else:
+                    study.student1_skill = skill
+
+            # both exist → update own only
+            else:
+                if study.student1 == student:
+                    study.student1_skill = skill
+                elif study.student2 == student:
+                    study.student2_skill = skill
+
+            study.save()
+
+        except StudyConnection.DoesNotExist:
+            pass
+
+    return Response(
+        {
+            "message": "Skill saved & linked to study ✅",
+            "offer": skill.offer,
+            "want": skill.want,
+        },
+        status=200
+    )
+def should_close_chat(study, student):
+    """
+    Close chat if:
+    1. Study status is Completed or Cancelled
+    2. OR current student's skill status is 1
+    """
+
+    if study.status in ["Completed", "Cancelled"]:
+        return True
+
+    # Check current student's skill status
+    if student == study.student1 and study.student1_skill and study.student1_skill.status == 1:
+        return True
+    if student == study.student2 and study.student2_skill and study.student2_skill.status == 1:
+        return True
+
+    return False
+@api_view(["GET"])
+def check_need_form(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    # ONLY ACTIVE STUDIES
+    study = StudyConnection.objects.filter(
+        Q(student1=student) | Q(student2=student),
+        status__in=["Started", "Progress"]
+    ).order_by("-study_id").first()
+
+    if not study:
+        return Response({"need_form": False}, status=200)
+
+    # =========================
+    # CONDITION
+    # =========================
+    if study.status == "Started":
+        return Response({
+            "need_form": True,
+            "study_id": study.study_id
+        })
+
+    if study.status == "Progress":
+        if not study.student1_skill or not study.student2_skill:
+            return Response({
+                "need_form": True,
+                "study_id": study.study_id
+            })
+
+    return Response({"need_form": False})
+
+
+@api_view(["GET"])
+def get_started_study(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study = StudyConnection.objects.filter(
+        Q(student1=student) | Q(student2=student),
+        status="Started"
+    ).order_by("-study_id").first()
+
+    if not study:
+        return Response({"exists": False}, status=200)
+
+    return Response({
+        "exists": True,
+        "study_id": study.study_id
+    }, status=200)
+@api_view(["GET"])
+def get_my_active_study_teacher(request):
+    student = get_student_from_token(request)
+    if not student:
+        return Response({"error": "Unauthorized"}, status=401)
+
+    study = StudyConnection.objects.filter(
+        Q(student1=student) | Q(student2=student),
+        status__in=["Started", "Progress"]
+    ).select_related("teacher").order_by("-study_id").first()
+
+    if not study:
+        return Response({"exists": False}, status=200)
+
+    if not study.teacher:
+        return Response({
+            "exists": True,
+            "study_id": study.study_id,
+            "teacher": None
+        })
+
+    t = study.teacher
+    return Response({
+        "exists": True,
+        "study_id": study.study_id,
+        "teacher": {
+            "teacher_id": t.teacher_id,
+            "name": t.name
+        }
+    })

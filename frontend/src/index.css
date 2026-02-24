@@ -1,0 +1,26 @@
+/* src/index.css */
+@import "tailwindcss";
+
+/* v4 Custom Theme Configuration */
+@theme {
+  --color-elevare-light: #F0F9FF;
+  --color-elevare-mid: #2563EB;
+  --color-elevare-blue: #1A3A5C;
+  --color-elevare-dark: #0F2744;
+  --color-elevare-bg: #F0F9FF;
+}
+
+/* Global Resets */
+@layer base {
+  :root {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    @apply bg-white text-gray-900;
+  }
+}

@@ -1,0 +1,92 @@
+/* Container */
+.account-container {
+  max-width: 900px;
+  margin: 30px auto;
+  padding: 20px;
+  background-color: #f0f4f8;
+  /* light soft background */
+  border-radius: 12px;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.07);
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+/* Page header */
+.account-container h2 {
+  color: #1e3a8a;
+  /* dark blue header */
+  margin-bottom: 25px;
+  font-size: 28px;
+  font-weight: 700;
+}
+
+/* Navigation list */
+.account-nav {
+  list-style: none;
+  padding: 0;
+  margin-bottom: 30px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 15px;
+}
+
+.account-nav li {}
+
+.account-nav li a {
+  text-decoration: none;
+  color: #2563eb;
+  /* blue links */
+  font-weight: 600;
+  padding: 10px 18px;
+  border-radius: 8px;
+  background-color: #e0e7ff;
+  /* light blue background */
+  transition: background-color 0.2s, transform 0.2s;
+}
+
+.account-nav li a:hover,
+.account-nav li a.active {
+  background-color: #1e40af;
+  /* darker blue */
+  color: white;
+  transform: translateY(-2px);
+}
+
+/* Logout button */
+.logout-btn {
+  padding: 10px 20px;
+  background-color: #f44336;
+  /* red */
+  color: white;
+  font-weight: 600;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background-color 0.2s, transform 0.2s;
+}
+
+.logout-btn:hover {
+  background-color: #d32f2f;
+  transform: scale(1.05);
+}
+
+/* Nested route content */
+.account-content {
+  background-color: #ffffff;
+  padding: 25px;
+  border-radius: 12px;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.05);
+  min-height: 300px;
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.account-content:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .account-nav {
+    flex-direction: column;
+  }
+}
