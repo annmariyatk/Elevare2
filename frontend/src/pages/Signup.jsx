@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   User, Mail, Lock, Phone, GraduationCap, Eye, EyeOff,
   CheckCircle, AlertCircle, ArrowRight, BookOpen, Star, Trophy, Loader,
-  Users, TrendingUp
+  Users, TrendingUp, ArrowLeft
 } from "lucide-react";
 import logo from "../assets/logo.png";
 import Swal from 'sweetalert2';
@@ -250,6 +250,18 @@ function Signup() {
         >
           <div className="form-container">
             <div className="form-header">
+              <button
+                onClick={() => navigate("/login")}
+                className="back-to-login-btn"
+                style={{
+                  background: 'none', border: 'none', cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', gap: '8px',
+                  color: '#64748b', marginBottom: '10px', padding: '0',
+                  fontSize: '0.9rem', fontWeight: '600'
+                }}
+              >
+                <ArrowLeft size={18} /> Back to Login
+              </button>
               <img src={logo} alt="Elevare Logo" className="logo-main" />
               <h2>Create Account</h2>
               <p className="form-subtitle">Fill in the details to start your journey</p>
